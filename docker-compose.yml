@@ -1,0 +1,10 @@
+services:
+  krishi-ai:
+    build: .
+    ports:
+      - "8061:8061"
+    volumes:
+      - .:/app
+    environment:
+      - PYTHONPATH=/app
+    restart: unless-stopped
