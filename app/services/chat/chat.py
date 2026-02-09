@@ -1,10 +1,12 @@
 import json
 import os
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import openai
 from dotenv import load_dotenv
 from .chat_schema import chatbot_request, chatbot_response
+from app.vectordb.manager import vector_db
+from app.utils.cache_manager import cache_manager
 
 
 load_dotenv()
@@ -16,54 +18,104 @@ class ChatbotAgent:
         self.reasoning_model = "gpt-4o"
 
     def chat(self, request: chatbot_request) -> chatbot_response:
-        """Generate chat response based on user message."""
-        prompt = self.create_prompt(request)
-        response_data = self.get_ai_response(prompt)
+        """Generate RAG-enhanced chat response with conversation history."""
         
-        if response_data and "response" in response_data:
-            return chatbot_response(response=response_data["response"])
-        return chatbot_response(response="I apologize, I'm having trouble generating a response. Please try again.")
-
-    def create_prompt(self, request: chatbot_request) -> str:
-        system_prompt = """You are Krishi AI, an expert agricultural assistant specialized in crop management, farming techniques, and sustainable agriculture practices. 
+        # Retrieve conversation history
+        conversation_history = cache_manager.get_conversation(request.chat_id) or []
+        
+        # Retrieve relevant knowledge from vector DB
+        relevant_chunks = vector_db.search(request.message, n_results=5)
+        
+        # Build context from retrieved chunks
+        context = self.build_context(relevant_chunks)
+        
+        # Create messages for OpenAI
+        messages = self.create_messages(request.message, context, conversation_history)
+        
+        # Get AI response
+        response_text = self.get_ai_response(messages)
+        
+        if not response_text:
+            response_text = "I apologize, I'm having trouble generating a response. Please try again."
+        
+        # Save to conversation history
+        cache_manager.add_message(request.chat_id, request.user_id, "user", request.message)
+        cache_manager.add_message(request.chat_id, request.user_id, "assistant", response_text)
+        
+        return chatbot_response(response=response_text)
+    
+    def build_context(self, chunks: List[Dict]) -> str:
+        """Build context string from retrieved chunks"""
+        if not chunks:
+            return ""
+        
+        context_parts = ["Here is relevant information from the agricultural knowledge base:\n"]
+        
+        for i, chunk in enumerate(chunks, 1):
+            metadata = chunk["metadata"]
+            doc_name = metadata.get("document_name", "Unknown")
+            section = metadata.get("section_title", "")
+            
+            context_parts.append(
+                f"\n[Source {i}: {doc_name} - {section}]\n{chunk['text']}\n"
+            )
+        
+        return "\n".join(context_parts)
+    
+    def create_messages(self, user_query: str, context: str, history: List[Dict]) -> List[Dict]:
+        """Create message list for OpenAI API"""
+        
+        system_prompt = """You are Krishi AI, an expert agricultural assistant specialized in crop management, farming techniques, and sustainable agriculture practices.
 
 Your role is to:
-- Provide accurate, practical advice on crop cultivation, pest management, soil health, and irrigation
+- Provide accurate, practical advice based on the provided knowledge base
 - Recommend solutions based on local farming conditions and best practices
 - Help farmers optimize crop yields and reduce losses
 - Explain complex agricultural concepts in simple, actionable terms
-- Consider environmental sustainability and cost-effectiveness in your recommendations
+- Consider environmental sustainability and cost-effectiveness
+- Always cite sources when using information from the knowledge base
 
-Always respond in a helpful, professional tone. If you're uncertain about specific regional practices, acknowledge it and provide general best practices. Format your response as a JSON object with a 'response' key containing your answer."""
+When answering:
+1. Use the provided context/sources to give accurate information
+2. If the context doesn't contain relevant information, use your general agricultural knowledge
+3. Be specific and actionable in your recommendations
+4. Maintain a helpful, professional tone"""
+
+        messages = [{"role": "system", "content": system_prompt}]
         
-        payload = {
-            "message": request.message
-        }
-        return json.dumps({
-            "system": system_prompt,
-            "payload": payload
-        })
+        # Add last 5 conversation turns for context (if available)
+        recent_history = history[-10:] if len(history) > 10 else history
+        for msg in recent_history:
+            messages.append({
+                "role": msg["role"],
+                "content": msg["content"]
+            })
+        
+        # Add current query with context
+        user_message = user_query
+        if context:
+            user_message = f"{context}\n\nUser Question: {user_query}"
+        
+        messages.append({"role": "user", "content": user_message})
+        
+        return messages
 
-    def get_ai_response(self, prompt: str) -> Dict[str, Any] | None:
-        """Call OpenAI API to generate affirmations."""
+    def get_ai_response(self, messages: List[Dict]) -> str | None:
+        """Call OpenAI API to generate response."""
         try:
-            payload_data = json.loads(prompt)
-            system_content = payload_data.get("system", "")
-            user_content = json.dumps(payload_data.get("payload", {}), ensure_ascii=False)
-
             response = self.client.chat.completions.create(
                 model=self.reasoning_model,
-                temperature=0.9,
-                response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": system_content},
-                    {"role": "user", "content": user_content},
-                ],
+                temperature=0.7,
+                messages=messages,
             )
             
             content = response.choices[0].message.content
-            if content:
-                return json.loads(content)
-        except Exception:
+            return content
+            
+        except Exception as e:
+            print(f"Error calling OpenAI API: {e}")
             return None
-        return None
+
+
+# Global instance
+chatbot_agent = ChatbotAgent()

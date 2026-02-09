@@ -6,3 +6,10 @@ python-dotenv
 httpx
 openai
 python-multipart
+redis
+chromadb
+tiktoken
+PyPDF2
+langchain
+langchain-community
+langchain-openai
