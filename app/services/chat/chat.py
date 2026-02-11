@@ -1,11 +1,13 @@
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TypedDict, Annotated
 import logging
 
 from dotenv import load_dotenv
 from groq import Groq
 import openai
+from langgraph.graph import StateGraph, END
+from operator import add
 
 from .chat_schema import chatbot_request, chatbot_response, conversation_history_request, conversation_history_response, Message
 from app.vectordb.manager import vector_db
@@ -62,10 +64,229 @@ class UnifiedLLMClient:
             raise
 
 
+class AgricultureChatState(TypedDict):
+    """LangGraph state for agriculture chatbot"""
+    user_query: str
+    user_id: str
+    chat_id: str
+    detected_language: Optional[str]  # Language of user query
+    translated_query: Optional[str]  # Query translated for vector search
+    is_agriculture_query: bool
+    is_followup: bool
+    skip_retrieval: bool
+    retrieved_contexts: List[Dict]
+    final_response: str
+    metadata: Dict[str, Any]
+
+
 class ChatbotAgent:
     def __init__(self):
         self.llm_client = UnifiedLLMClient()
         self.reasoning_model = self.llm_client.model  # For backward compatibility
+    
+    # ==================== LangGraph Nodes ====================
+    
+    def detect_language_and_guardrail_node(self, state: AgricultureChatState) -> AgricultureChatState:
+        """
+        Combined node: Detect language + Agriculture guardrail + Follow-up detection
+        Single LLM call for efficiency
+        """
+        logger.info(f"[GUARDRAIL] Starting check for: {state['user_query'][:50]}...")
+        
+        # Get recent history for context
+        recent_history = cache_manager.get_conversation_by_user(state['user_id'], state['chat_id']) or []
+        recent_history = recent_history[-3:] if len(recent_history) > 3 else recent_history
+        
+        history_context = ""
+        if recent_history:
+            history_lines = [f"User: {h['content']}" if h['role'] == 'user' else f"Assistant: {h['content']}" 
+                           for h in recent_history]
+            history_context = "\n".join(history_lines)
+        
+        prompt = f"""You are a classifier for an agriculture chatbot. Analyze the user's query.
+
+Conversation History:
+{history_context if history_context else "[No previous conversation]"}
+
+Current User Query: {state['user_query']}
+
+Answer THREE questions in JSON format:
+1. What is the language of the current query? Options: "bangla", "romanized_bangla", "english", "other"
+2. Is this query related to AGRICULTURE topics? (crops, farming, pests, soil, irrigation, livestock, etc.)
+3. Is this a FOLLOW-UP question referencing previous conversation?
+
+Respond with ONLY valid JSON:
+{{"detected_language": "bangla|romanized_bangla|english|other", "is_agriculture": true/false, "is_followup": true/false, "reason": "brief explanation"}}"""
+        
+        try:
+            messages = [
+                {"role": "system", "content": "You are a precise classifier. Always respond with valid JSON."},
+                {"role": "user", "content": prompt}
+            ]
+            
+            response = self.llm_client.chat(messages, temperature=0.3)
+            result = json.loads(response)
+            
+            state["detected_language"] = result.get("detected_language", "english")
+            state["is_agriculture_query"] = result.get("is_agriculture", True)
+            state["is_followup"] = result.get("is_followup", False)
+            state["skip_retrieval"] = result.get("is_followup", False)
+            state["metadata"]["classification"] = result.get("reason", "")
+            
+            logger.info(f"[GUARDRAIL] Language: {state['detected_language']}, "
+                       f"Agriculture: {state['is_agriculture_query']}, "
+                       f"Followup: {state['is_followup']}")
+            
+        except Exception as e:
+            logger.error(f"[GUARDRAIL] Classification error: {str(e)}")
+            # Safe defaults
+            state["detected_language"] = "english"
+            state["is_agriculture_query"] = True
+            state["is_followup"] = False
+            state["skip_retrieval"] = False
+        
+        return state
+    
+    def translate_query_node(self, state: AgricultureChatState) -> AgricultureChatState:
+        """
+        Translate query to vector DB language if needed
+        """
+        target_lang = settings.VECTOR_DB_LANGUAGE.lower()
+        detected_lang = state["detected_language"]
+        
+        logger.info(f"[TRANSLATE] Detected: {detected_lang}, Target: {target_lang}")
+        
+        # If already in target language, no translation needed
+        if (target_lang == "english" and detected_lang in ["english"]) or \
+           (target_lang == "bangla" and detected_lang in ["bangla", "romanized_bangla"]):
+            state["translated_query"] = state["user_query"]
+            logger.info(f"[TRANSLATE] No translation needed")
+            return state
+        
+        # Need translation
+        lang_map = {
+            "bangla": "Bengali/Bangla",
+            "romanized_bangla": "Bengali/Bangla (using romanized text)",
+            "english": "English",
+            "other": detected_lang
+        }
+        
+        target_lang_name = "English" if target_lang == "english" else "Bengali/Bangla"
+        source_lang_name = lang_map.get(detected_lang, "the detected language")
+        
+        prompt = f"""Translate the following text from {source_lang_name} to {target_lang_name}.
+Keep agricultural terminology accurate. Only output the translation, nothing else.
+
+Text: {state['user_query']}"""
+        
+        try:
+            messages = [
+                {"role": "system", "content": f"You are a translator. Translate to {target_lang_name}."},
+                {"role": "user", "content": prompt}
+            ]
+            
+            translated = self.llm_client.chat(messages, temperature=0.3)
+            state["translated_query"] = translated.strip()
+            logger.info(f"[TRANSLATE] Translated: {state['translated_query'][:50]}...")
+            
+        except Exception as e:
+            logger.error(f"[TRANSLATE] Translation error: {str(e)}")
+            state["translated_query"] = state["user_query"]  # Fallback to original
+        
+        return state
+    
+    def retrieve_knowledge_node(self, state: AgricultureChatState) -> AgricultureChatState:
+        """
+        Search vector DB for relevant agricultural knowledge
+        """
+        query = state["translated_query"] or state["user_query"]
+        logger.info(f"[RETRIEVAL] Searching for: {query[:50]}...")
+        
+        try:
+            results = vector_db.search(query, n_results=5)
+            state["retrieved_contexts"] = results if results else []
+            logger.info(f"[RETRIEVAL] Found {len(state['retrieved_contexts'])} results")
+        
+        except Exception as e:
+            logger.error(f"[RETRIEVAL] Error: {str(e)}")
+            state["retrieved_contexts"] = []
+            state["metadata"]["retrieval_error"] = str(e)
+        
+        return state
+    
+    def generate_response_node(self, state: AgricultureChatState) -> AgricultureChatState:
+        """
+        Generate response in Bangla using LLM with RAG context
+        """
+        logger.info(f"[GENERATION] Generating Bangla response...")
+        
+        # Build context from retrieved knowledge
+        context = self.build_context(state["retrieved_contexts"])
+        
+        # Get conversation history for context
+        conversation_history = cache_manager.get_conversation_by_user(
+            state['user_id'], state['chat_id']
+        ) or []
+        recent_history = conversation_history[-5:] if len(conversation_history) > 5 else conversation_history
+        
+        # Create messages
+        system_prompt = """তুমি কৃষি বিষয়ক বিশেষজ্ঞ সহায়ক। তোমার কাজ হল:
+- সবসময় বাংলায় উত্তর দিতে হবে
+- প্রদত্ত তথ্য থেকে সঠিক ও ব্যবহারিক পরামর্শ দিতে হবে  
+- স্থানীয় কৃষি পদ্ধতি ও পরিবেশ বিবেচনা করতে হবে
+- জটিল বিষয় সহজভাবে ব্যাখ্যা করতে হবে
+
+You are an agriculture expert assistant. Your task:
+- Always respond in Bengali/Bangla language
+- Provide accurate, practical advice from the knowledge base
+- Consider local farming practices and environment
+- Explain complex topics simply"""
+        
+        messages = [{"role": "system", "content": system_prompt}]
+        
+        # Add conversation history
+        for msg in recent_history:
+            messages.append({
+                "role": msg["role"],
+                "content": msg["content"]
+            })
+        
+        # Add current query with context
+        user_message = state['user_query']
+        if context:
+            user_message = f"প্রাসঙ্গিক তথ্য:\n{context}\n\nপ্রশ্ন: {state['user_query']}"
+        
+        messages.append({"role": "user", "content": user_message})
+        
+        try:
+            response_text = self.llm_client.chat(messages, temperature=0.7)
+            state["final_response"] = response_text
+            logger.info(f"[GENERATION] Response generated ({len(response_text)} chars)")
+        
+        except Exception as e:
+            logger.error(f"[GENERATION] Error: {str(e)}")
+            state["final_response"] = "দুঃখিত, একটি ত্রুটি হয়েছে। আবার চেষ্টা করুন। (Sorry, an error occurred. Please try again.)"
+            state["metadata"]["generation_error"] = str(e)
+        
+        return state
+    
+    def reject_query_node(self, state: AgricultureChatState) -> AgricultureChatState:
+        """
+        Politely reject non-agriculture queries in Bangla
+        """
+        state["final_response"] = """দুঃখিত, আমি শুধুমাত্র কৃষি সম্পর্কিত প্রশ্নের উত্তর দিতে পারি। 
+
+আপনি আমাকে এইসব বিষয়ে জিজ্ঞাসা করতে পারেন:
+- ফসল চাষাবাদ
+- কীটপতঙ্গ ও রোগ নিয়ন্ত্রণ
+- মাটির যত্ন ও সার
+- সেচ ব্যবস্থা
+- পশুপালন
+
+(Sorry, I can only answer agriculture-related questions. You can ask me about crops, pests, soil, irrigation, livestock, etc.)"""
+        
+        logger.info(f"[REJECT] Query rejected - not agriculture related")
+        return state
 
     def chat(self, request: chatbot_request) -> chatbot_response:
         """Generate RAG-enhanced chat response with conversation history."""
