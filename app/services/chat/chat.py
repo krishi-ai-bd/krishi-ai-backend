@@ -1,21 +1,71 @@
 import json
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+import logging
 
-import openai
 from dotenv import load_dotenv
+from groq import Groq
+import openai
+
 from .chat_schema import chatbot_request, chatbot_response, conversation_history_request, conversation_history_response, Message
 from app.vectordb.manager import vector_db
 from app.utils.cache_manager import cache_manager
+from app.core.config import settings
 
 
 load_dotenv()
+logger = logging.getLogger(__name__)
+
+
+class UnifiedLLMClient:
+    """
+    Dynamic LLM client that switches between Groq and OpenAI.
+    Controlled by settings.LLM_PROVIDER
+    """
+    
+    def __init__(self):
+        self.provider = settings.LLM_PROVIDER.lower()
+        
+        if self.provider == "groq":
+            self.client = Groq(api_key=settings.GROQ_API_KEY)
+            self.model = settings.GROQ_MODEL
+            logger.info(f"[LLM] Using Groq with model: {self.model}")
+        elif self.provider == "openai":
+            self.client = openai.OpenAI(api_key=settings.OPENAI_API_KEY)
+            self.model = settings.OPENAI_MODEL
+            logger.info(f"[LLM] Using OpenAI with model: {self.model}")
+        else:
+            raise ValueError(f"Invalid LLM_PROVIDER: {self.provider}. Use 'groq' or 'openai'")
+    
+    def chat(self, messages: List[Dict[str, str]], temperature: float = 0.7) -> str:
+        """
+        Unified chat completion interface for both providers
+        """
+        try:
+            if self.provider == "groq":
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=temperature
+                )
+            elif self.provider == "openai":
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=temperature
+                )
+            
+            return response.choices[0].message.content
+        
+        except Exception as e:
+            logger.error(f"[LLM] Error calling {self.provider}: {str(e)}")
+            raise
 
 
 class ChatbotAgent:
     def __init__(self):
-        self.client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        self.reasoning_model = "gpt-4o"
+        self.llm_client = UnifiedLLMClient()
+        self.reasoning_model = self.llm_client.model  # For backward compatibility
 
     def chat(self, request: chatbot_request) -> chatbot_response:
         """Generate RAG-enhanced chat response with conversation history."""
@@ -123,19 +173,13 @@ When answering:
         return conversation_history_response(messages=message_objects)
 
     def get_ai_response(self, messages: List[Dict]) -> str | None:
-        """Call OpenAI API to generate response."""
+        """Call LLM API to generate response (Groq or OpenAI based on config)."""
         try:
-            response = self.client.chat.completions.create(
-                model=self.reasoning_model,
-                temperature=0.7,
-                messages=messages,
-            )
-            
-            content = response.choices[0].message.content
+            content = self.llm_client.chat(messages, temperature=0.7)
             return content
             
         except Exception as e:
-            print(f"Error calling OpenAI API: {e}")
+            logger.error(f"Error calling LLM API: {e}")
             return None
 
 
