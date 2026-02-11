@@ -83,6 +83,8 @@ class ChatbotAgent:
     def __init__(self):
         self.llm_client = UnifiedLLMClient()
         self.reasoning_model = self.llm_client.model  # For backward compatibility
+        self.graph = self._build_graph()  # Build LangGraph workflow
+        logger.info("[AGENT] Agriculture chatbot initialized with LangGraph")
     
     # ==================== LangGraph Nodes ====================
     
@@ -287,33 +289,106 @@ You are an agriculture expert assistant. Your task:
         
         logger.info(f"[REJECT] Query rejected - not agriculture related")
         return state
+    
+    # ==================== Routing Logic ====================
+    
+    def route_after_guardrail(self, state: AgricultureChatState) -> str:
+        """Route based on guardrail results"""
+        if not state['is_agriculture_query']:
+            logger.info(f"[ROUTING] → reject (non-agriculture)")
+            return "reject"
+        
+        if state['skip_retrieval'] or state['is_followup']:
+            logger.info(f"[ROUTING] → generate (follow-up, skip retrieval)")
+            return "skip_to_generate"
+        
+        logger.info(f"[ROUTING] → translate (new query, need retrieval)")
+        return "translate"
+    
+    # ==================== Graph Builder ====================
+    
+    def _build_graph(self) -> StateGraph:
+        """Build the LangGraph workflow"""
+        workflow = StateGraph(AgricultureChatState)
+        
+        # Add nodes
+        workflow.add_node("guardrail", self.detect_language_and_guardrail_node)
+        workflow.add_node("translate", self.translate_query_node)
+        workflow.add_node("retrieve", self.retrieve_knowledge_node)
+        workflow.add_node("generate", self.generate_response_node)
+        workflow.add_node("reject", self.reject_query_node)
+        
+        # Set entry point
+        workflow.set_entry_point("guardrail")
+        
+        # Conditional routing after guardrail
+        workflow.add_conditional_edges(
+            "guardrail",
+            self.route_after_guardrail,
+            {
+                "reject": "reject",
+                "skip_to_generate": "generate",
+                "translate": "translate"
+            }
+        )
+        
+        # Linear flow: translate → retrieve → generate
+        workflow.add_edge("translate", "retrieve")
+        workflow.add_edge("retrieve", "generate")
+        
+        # End nodes
+        workflow.add_edge("generate", END)
+        workflow.add_edge("reject", END)
+        
+        return workflow.compile()
+    
+    # ==================== Main Chat Interface ====================
 
     def chat(self, request: chatbot_request) -> chatbot_response:
-        """Generate RAG-enhanced chat response with conversation history."""
+        """
+        LangGraph-based chat interface
+        - Detects language
+        - Checks agriculture relevance
+        - Translates query for vector search
+        - Generates response in Bangla
+        - Saves to Redis for frontend
+        """
+        logger.info(f"\n{'='*80}")
+        logger.info(f"[CHAT] New request from user: {request.user_id}")
+        logger.info(f"[CHAT] Chat ID: {request.chat_id}")
+        logger.info(f"[CHAT] Message: {request.message}")
+        logger.info(f"{'='*80}")
         
-        # Retrieve conversation history
-        conversation_history = cache_manager.get_conversation(request.chat_id) or []
+        # Initialize state
+        initial_state: AgricultureChatState = {
+            "user_query": request.message,
+            "user_id": request.user_id,
+            "chat_id": request.chat_id,
+            "detected_language": None,
+            "translated_query": None,
+            "is_agriculture_query": False,
+            "is_followup": False,
+            "skip_retrieval": False,
+            "retrieved_contexts": [],
+            "final_response": "",
+            "metadata": {}
+        }
         
-        # Retrieve relevant knowledge from vector DB
-        relevant_chunks = vector_db.search(request.message, n_results=5)
+        # Execute LangGraph workflow
+        logger.info(f"[CHAT] Starting LangGraph execution...")
+        final_state = self.graph.invoke(initial_state)
+        logger.info(f"[CHAT] LangGraph execution completed")
         
-        # Build context from retrieved chunks
-        context = self.build_context(relevant_chunks)
-        
-        # Create messages for OpenAI
-        messages = self.create_messages(request.message, context, conversation_history)
-        
-        # Get AI response
-        response_text = self.get_ai_response(messages)
-        
-        if not response_text:
-            response_text = "I apologize, I'm having trouble generating a response. Please try again."
-        
-        # Save to conversation history
+        # Save to Redis for frontend display
         cache_manager.add_message(request.chat_id, request.user_id, "user", request.message)
-        cache_manager.add_message(request.chat_id, request.user_id, "assistant", response_text)
+        cache_manager.add_message(request.chat_id, request.user_id, "assistant", final_state['final_response'])
         
-        return chatbot_response(response=response_text)
+        logger.info(f"[CHAT] Response length: {len(final_state['final_response'])} chars")
+        if final_state['metadata']:
+            logger.warning(f"[CHAT] Metadata: {final_state['metadata']}")
+        logger.info(f"{'='*80}\n")
+        
+        return chatbot_response(response=final_state['final_response'])
     
     def build_context(self, chunks: List[Dict]) -> str:
         """Build context string from retrieved chunks"""
@@ -333,43 +408,6 @@ You are an agriculture expert assistant. Your task:
         
         return "\n".join(context_parts)
     
-    def create_messages(self, user_query: str, context: str, history: List[Dict]) -> List[Dict]:
-        """Create message list for OpenAI API"""
-        
-        system_prompt = """You are Krishi AI, an expert agricultural assistant specialized in crop management, farming techniques, and sustainable agriculture practices.
-
-Your role is to:
-- Provide accurate, practical advice based on the provided knowledge base
-- Recommend solutions based on local farming conditions and best practices
-- Help farmers optimize crop yields and reduce losses
-- Explain complex agricultural concepts in simple, actionable terms
-- Consider environmental sustainability and cost-effectiveness
-- Always cite sources when using information from the knowledge base
-
-When answering:
-1. Use the provided context/sources to give accurate information
-2. If the context doesn't contain relevant information, use your general agricultural knowledge
-3. Be specific and actionable in your recommendations
-4. Maintain a helpful, professional tone"""
-
-        messages = [{"role": "system", "content": system_prompt}]
-        
-        # Add last 5 conversation turns for context (if available)
-        recent_history = history[-10:] if len(history) > 10 else history
-        for msg in recent_history:
-            messages.append({
-                "role": msg["role"],
-                "content": msg["content"]
-            })
-        
-        # Add current query with context
-        user_message = user_query
-        if context:
-            user_message = f"{context}\n\nUser Question: {user_query}"
-        
-        messages.append({"role": "user", "content": user_message})
-        
-        return messages
     
     def get_conversation(self, request: conversation_history_request) -> conversation_history_response:
         """Retrieve full conversation history for a user and chat_id"""
@@ -392,16 +430,6 @@ When answering:
         ]
         
         return conversation_history_response(messages=message_objects)
-
-    def get_ai_response(self, messages: List[Dict]) -> str | None:
-        """Call LLM API to generate response (Groq or OpenAI based on config)."""
-        try:
-            content = self.llm_client.chat(messages, temperature=0.7)
-            return content
-            
-        except Exception as e:
-            logger.error(f"Error calling LLM API: {e}")
-            return None
 
 
 # Global instance
