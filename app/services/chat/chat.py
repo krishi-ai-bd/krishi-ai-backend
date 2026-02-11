@@ -4,7 +4,7 @@ from typing import Any, Dict, List
 
 import openai
 from dotenv import load_dotenv
-from .chat_schema import chatbot_request, chatbot_response
+from .chat_schema import chatbot_request, chatbot_response, conversation_history_request, conversation_history_response, Message
 from app.vectordb.manager import vector_db
 from app.utils.cache_manager import cache_manager
 
@@ -99,6 +99,28 @@ When answering:
         messages.append({"role": "user", "content": user_message})
         
         return messages
+    
+    def get_conversation(self, request: conversation_history_request) -> conversation_history_response:
+        """Retrieve full conversation history for a user and chat_id"""
+        
+        # Get conversation with user verification
+        messages = cache_manager.get_conversation_by_user(request.user_id, request.chat_id)
+        
+        if messages is None:
+            # Return empty conversation if not found or unauthorized
+            return conversation_history_response(messages=[])
+        
+        # Convert to Message objects
+        message_objects = [
+            Message(
+                role=msg["role"],
+                content=msg["content"],
+                timestamp=msg["timestamp"]
+            )
+            for msg in messages
+        ]
+        
+        return conversation_history_response(messages=message_objects)
 
     def get_ai_response(self, messages: List[Dict]) -> str | None:
         """Call OpenAI API to generate response."""

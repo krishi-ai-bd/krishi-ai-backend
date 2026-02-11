@@ -44,6 +44,24 @@ class ConversationCacheManager:
             print(f"Error retrieving conversation {conversation_id}: {e}")
             return None
     
+    def get_conversation_by_user(self, user_id: str, conversation_id: str) -> Optional[List[Dict]]:
+        """Retrieve conversation with user ownership verification"""
+        if not self.redis_client:
+            return None
+        
+        try:
+            # Verify conversation belongs to user
+            user_conversations = self.get_user_conversations(user_id)
+            if conversation_id not in user_conversations:
+                print(f"Conversation {conversation_id} does not belong to user {user_id}")
+                return None
+            
+            # Retrieve conversation
+            return self.get_conversation(conversation_id)
+        except Exception as e:
+            print(f"Error retrieving conversation for user {user_id}: {e}")
+            return None
+    
     def add_message(self, conversation_id: str, user_id: str, role: str, content: str):
         """Add a message to a conversation and update user activity"""
         if not self.redis_client:
