@@ -2,13 +2,14 @@ import chromadb
 from chromadb.config import Settings as ChromaSettings
 from typing import List, Dict, Optional
 import openai
+import threading
 from app.core.config import settings
 
 
 class VectorDBManager:
     """
     Manages ChromaDB for agricultural knowledge storage and retrieval.
-    Handles embedding generation and semantic search.
+    Handles embedding generation and semantic search with API key rotation.
     """
     
     def __init__(self):
@@ -24,15 +25,33 @@ class VectorDBManager:
             metadata={"description": "Agricultural knowledge base with PDF chunks"}
         )
         
-        # OpenAI client for embeddings
-        self.openai_client = openai.OpenAI(api_key=settings.OPENAI_API_KEY)
+        # Load OpenAI API keys for embeddings
+        self.openai_keys = settings.load_api_keys("openai")
+        if not self.openai_keys:
+            raise ValueError("No OpenAI API keys found for embeddings")
+        
+        # Round-robin counter for embeddings
+        self._embedding_counter = 0
+        self._embedding_lock = threading.Lock()
         
         print(f"✓ VectorDB initialized with {self.collection.count()} chunks")
+        print(f"✓ Using {len(self.openai_keys)} OpenAI keys for embeddings")
+    
+    def _get_next_openai_key(self) -> str:
+        """Get next OpenAI API key for embeddings (thread-safe)"""
+        with self._embedding_lock:
+            key = self.openai_keys[self._embedding_counter % len(self.openai_keys)]
+            self._embedding_counter += 1
+            return key
     
     def get_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """Generate embeddings using OpenAI"""
+        """Generate embeddings using OpenAI with key rotation"""
         try:
-            response = self.openai_client.embeddings.create(
+            # Get next API key
+            api_key = self._get_next_openai_key()
+            client = openai.OpenAI(api_key=api_key)
+            
+            response = client.embeddings.create(
                 model=settings.EMBEDDING_MODEL,
                 input=texts
             )

@@ -1,4 +1,5 @@
 import os
+from typing import List
 from pydantic_settings import BaseSettings
 from dotenv import load_dotenv
 
@@ -8,11 +9,11 @@ class Settings(BaseSettings):
     # LLM Provider Configuration
     LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "groq")  # "groq" or "openai"
     
-    # OpenAI
+    # OpenAI - Single key fallback (deprecated, use multiple keys)
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
     OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o")
     
-    # Groq
+    # Groq - Single key fallback (deprecated, use multiple keys)
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
     GROQ_MODEL: str = os.getenv("GROQ_MODEL", "mixtral-8x7b-32768")
     
@@ -39,5 +40,32 @@ class Settings(BaseSettings):
     # RAG Configuration
     TOP_K_RESULTS: int = 5  # number of chunks to retrieve
     SIMILARITY_THRESHOLD: float = 0.7
+    
+    def load_api_keys(self, provider: str) -> List[str]:
+        """
+        Load multiple API keys for a provider from environment variables.
+        Looks for keys like: OPENAI_API_KEY_1, OPENAI_API_KEY_2, etc.
+        Falls back to single key if multiple keys not found.
+        """
+        keys = []
+        prefix = f"{provider.upper()}_API_KEY"
+        
+        # Try to load numbered keys (_1, _2, _3, ...)
+        i = 1
+        while True:
+            key = os.getenv(f"{prefix}_{i}", "")
+            if key:
+                keys.append(key)
+                i += 1
+            else:
+                break
+        
+        # If no numbered keys found, use single key
+        if not keys:
+            single_key = os.getenv(prefix, "")
+            if single_key:
+                keys.append(single_key)
+        
+        return [k for k in keys if k]  # Filter empty strings
 
 settings = Settings()    

@@ -19,48 +19,76 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 
+
+
 class UnifiedLLMClient:
     """
-    Dynamic LLM client that switches between Groq and OpenAI.
-    Controlled by settings.LLM_PROVIDER
+    Dynamic LLM client with round-robin API key rotation.
+    Supports multiple API keys for load balancing.
+    Thread-safe for concurrent requests.
     """
     
     def __init__(self):
-        self.provider = settings.LLM_PROVIDER.lower()
+        import threading
         
+        self.provider = settings.LLM_PROVIDER.lower()
+        self.model = settings.GROQ_MODEL if self.provider == "groq" else settings.OPENAI_MODEL
+        
+        # Load multiple API keys
+        self.api_keys = settings.load_api_keys(self.provider)
+        
+        if not self.api_keys:
+            raise ValueError(f"No API keys found for provider: {self.provider}")
+        
+        # Thread-safe counter for round-robin
+        self._counter = 0
+        self._lock = threading.Lock()
+        
+        logger.info(f"[LLM] Using {self.provider.upper()} with {len(self.api_keys)} API keys")
+        logger.info(f"[LLM] Model: {self.model}")
+        logger.info(f"[LLM] Round-robin rotation enabled")
+    
+    def _get_next_key(self) -> str:
+        """Get next API key in round-robin fashion (thread-safe)"""
+        with self._lock:
+            key = self.api_keys[self._counter % len(self.api_keys)]
+            self._counter += 1
+            return key
+    
+    def _create_client(self, api_key: str):
+        """Create client instance with specific API key"""
         if self.provider == "groq":
-            self.client = Groq(api_key=settings.GROQ_API_KEY)
-            self.model = settings.GROQ_MODEL
-            logger.info(f"[LLM] Using Groq with model: {self.model}")
+            return Groq(api_key=api_key)
         elif self.provider == "openai":
-            self.client = openai.OpenAI(api_key=settings.OPENAI_API_KEY)
-            self.model = settings.OPENAI_MODEL
-            logger.info(f"[LLM] Using OpenAI with model: {self.model}")
+            return openai.OpenAI(api_key=api_key)
         else:
-            raise ValueError(f"Invalid LLM_PROVIDER: {self.provider}. Use 'groq' or 'openai'")
+            raise ValueError(f"Invalid provider: {self.provider}")
     
     def chat(self, messages: List[Dict[str, str]], temperature: float = 0.7) -> str:
         """
-        Unified chat completion interface for both providers
+        Unified chat completion with automatic key rotation
         """
+        # Get next API key
+        api_key = self._get_next_key()
+        key_index = (self._counter - 1) % len(self.api_keys) + 1
+        
+        logger.debug(f"[LLM] Using API key #{key_index}/{len(self.api_keys)}")
+        
         try:
-            if self.provider == "groq":
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    temperature=temperature
-                )
-            elif self.provider == "openai":
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    temperature=temperature
-                )
+            # Create client with rotated key
+            client = self._create_client(api_key)
+            
+            # Make API call
+            response = client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=temperature
+            )
             
             return response.choices[0].message.content
         
         except Exception as e:
-            logger.error(f"[LLM] Error calling {self.provider}: {str(e)}")
+            logger.error(f"[LLM] Error with {self.provider} key #{key_index}: {str(e)}")
             raise
 
 

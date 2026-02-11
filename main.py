@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.services.chat.chat_route import router as chat_router
-from app.services.documents.document_route import router as document_router
+from app.utils.knowledge.knowledge_route import router as knowledge_router
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -21,7 +21,7 @@ app.add_middleware(
 
 # Include routers
 app.include_router(chat_router, prefix="/api", tags=["Chat"])
-app.include_router(document_router, prefix="/api", tags=["Documents"])
+app.include_router(knowledge_router, prefix="/api", tags=["Knowledge"])
 
 
 @app.get("/")
