@@ -7,7 +7,7 @@ load_dotenv()
 
 class Settings(BaseSettings):
     # LLM Provider Configuration
-    LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "groq")  # "groq" or "openai"
+    LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "openai")  # "openai", "groq", or "both"
     
     # OpenAI - Single key fallback (deprecated, use multiple keys)
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")

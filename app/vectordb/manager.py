@@ -28,14 +28,17 @@ class VectorDBManager:
         # Load OpenAI API keys for embeddings
         self.openai_keys = settings.load_api_keys("openai")
         if not self.openai_keys:
-            raise ValueError("No OpenAI API keys found for embeddings")
+            print("⚠ WARNING: No OpenAI API keys found for embeddings. Add OPENAI_API_KEY_1, OPENAI_API_KEY_2, etc. to .env")
+            print("⚠ VectorDB will not work until API keys are added")
+            self.openai_keys = []  # Empty list, will fail when trying to embed
         
         # Round-robin counter for embeddings
         self._embedding_counter = 0
         self._embedding_lock = threading.Lock()
         
         print(f"✓ VectorDB initialized with {self.collection.count()} chunks")
-        print(f"✓ Using {len(self.openai_keys)} OpenAI keys for embeddings")
+        if self.openai_keys:
+            print(f"✓ Using {len(self.openai_keys)} OpenAI keys for embeddings")
     
     def _get_next_openai_key(self) -> str:
         """Get next OpenAI API key for embeddings (thread-safe)"""
@@ -46,6 +49,10 @@ class VectorDBManager:
     
     def get_embeddings(self, texts: List[str]) -> List[List[float]]:
         """Generate embeddings using OpenAI with key rotation"""
+        if not self.openai_keys:
+            print("Error generating embeddings: No OpenAI API keys configured")
+            return []
+        
         try:
             # Get next API key
             api_key = self._get_next_openai_key()

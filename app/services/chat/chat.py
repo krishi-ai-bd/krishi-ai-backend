@@ -23,64 +23,97 @@ logger = logging.getLogger(__name__)
 
 class UnifiedLLMClient:
     """
-    Dynamic LLM client with round-robin API key rotation.
-    Supports multiple API keys for load balancing.
-    Thread-safe for concurrent requests.
+    Dynamic LLM client with multi-provider support.
+    Modes: 'openai', 'groq', or 'both'
+    Thread-safe round-robin rotation.
     """
     
     def __init__(self):
         import threading
         
-        self.provider = settings.LLM_PROVIDER.lower()
-        self.model = settings.GROQ_MODEL if self.provider == "groq" else settings.OPENAI_MODEL
+        self.mode = settings.LLM_PROVIDER.lower()  # "openai", "groq", or "both"
         
-        # Load multiple API keys
-        self.api_keys = settings.load_api_keys(self.provider)
+        # Load API keys for each provider
+        openai_keys = settings.load_api_keys("openai")
+        groq_keys = settings.load_api_keys("groq")
         
-        if not self.api_keys:
-            raise ValueError(f"No API keys found for provider: {self.provider}")
+        # Build key pool based on mode
+        self.key_pool = []  # List of (provider, api_key, model) tuples
         
-        # Thread-safe counter for round-robin
+        if self.mode == "openai":
+            if not openai_keys:
+                logger.warning("[LLM] No OpenAI keys found. Add OPENAI_API_KEY_1, OPENAI_API_KEY_2, etc.")
+            for key in openai_keys:
+                self.key_pool.append(("openai", key, settings.OPENAI_MODEL))
+        
+        elif self.mode == "groq":
+            if not groq_keys:
+                logger.warning("[LLM] No Groq keys found. Add GROQ_API_KEY_1, GROQ_API_KEY_2, etc.")
+            for key in groq_keys:
+                self.key_pool.append(("groq", key, settings.GROQ_MODEL))
+        
+        elif self.mode == "both":
+            if not openai_keys:
+                logger.warning("[LLM] No OpenAI keys found")
+            if not groq_keys:
+                logger.warning("[LLM] No Groq keys found")
+            
+            # Combine both providers
+            for key in openai_keys:
+                self.key_pool.append(("openai", key, settings.OPENAI_MODEL))
+            for key in groq_keys:
+                self.key_pool.append(("groq", key, settings.GROQ_MODEL))
+        
+        else:
+            raise ValueError(f"Invalid LLM_PROVIDER: {self.mode}. Use 'openai', 'groq', or 'both'")
+        
+        if not self.key_pool:
+            logger.error(f"[LLM] No API keys available for mode '{self.mode}'. Chat will not work!")
+        
+        # Thread-safe counter
         self._counter = 0
         self._lock = threading.Lock()
         
-        logger.info(f"[LLM] Using {self.provider.upper()} with {len(self.api_keys)} API keys")
-        logger.info(f"[LLM] Model: {self.model}")
+        logger.info(f"[LLM] Mode: {self.mode.upper()}")
+        logger.info(f"[LLM] Total keys: {len(self.key_pool)} ({len(openai_keys)} OpenAI, {len(groq_keys)} Groq)")
         logger.info(f"[LLM] Round-robin rotation enabled")
     
-    def _get_next_key(self) -> str:
-        """Get next API key in round-robin fashion (thread-safe)"""
+    def _get_next_key(self):
+        """Get next (provider, api_key, model) in round-robin (thread-safe)"""
+        if not self.key_pool:
+            raise RuntimeError("No API keys configured. Add keys to .env")
+        
         with self._lock:
-            key = self.api_keys[self._counter % len(self.api_keys)]
+            key_info = self.key_pool[self._counter % len(self.key_pool)]
             self._counter += 1
-            return key
+            return key_info
     
-    def _create_client(self, api_key: str):
-        """Create client instance with specific API key"""
-        if self.provider == "groq":
+    def _create_client(self, provider: str, api_key: str):
+        """Create client instance for specific provider"""
+        if provider == "groq":
             return Groq(api_key=api_key)
-        elif self.provider == "openai":
+        elif provider == "openai":
             return openai.OpenAI(api_key=api_key)
         else:
-            raise ValueError(f"Invalid provider: {self.provider}")
+            raise ValueError(f"Unknown provider: {provider}")
     
     def chat(self, messages: List[Dict[str, str]], temperature: float = 0.7) -> str:
         """
-        Unified chat completion with automatic key rotation
+        Unified chat completion with automatic key rotation across providers
         """
-        # Get next API key
-        api_key = self._get_next_key()
-        key_index = (self._counter - 1) % len(self.api_keys) + 1
+        # Get next key
+        provider, api_key, model = self._get_next_key()
+        key_index = (self._counter - 1) % len(self.key_pool) + 1
         
-        logger.debug(f"[LLM] Using API key #{key_index}/{len(self.api_keys)}")
+        logger.debug(f"[LLM] Using {provider.upper()} key #{key_index}/{len(self.key_pool)}")
         
         try:
-            # Create client with rotated key
-            client = self._create_client(api_key)
+            # Create client
+            client = self._create_client(provider, api_key)
             
             # Make API call
             response = client.chat.completions.create(
-                model=self.model,
+                model=model,
                 messages=messages,
                 temperature=temperature
             )
@@ -88,7 +121,7 @@ class UnifiedLLMClient:
             return response.choices[0].message.content
         
         except Exception as e:
-            logger.error(f"[LLM] Error with {self.provider} key #{key_index}: {str(e)}")
+            logger.error(f"[LLM] Error with {provider} key #{key_index}: {str(e)}")
             raise
 
 
@@ -110,7 +143,6 @@ class AgricultureChatState(TypedDict):
 class ChatbotAgent:
     def __init__(self):
         self.llm_client = UnifiedLLMClient()
-        self.reasoning_model = self.llm_client.model  # For backward compatibility
         self.graph = self._build_graph()  # Build LangGraph workflow
         logger.info("[AGENT] Agriculture chatbot initialized with LangGraph")
     
@@ -140,21 +172,29 @@ Conversation History:
 
 Current User Query: {state['user_query']}
 
-Answer THREE questions in JSON format:
-1. What is the language of the current query? Options: "bangla", "romanized_bangla", "english", "other"
-2. Is this query related to AGRICULTURE topics? (crops, farming, pests, soil, irrigation, livestock, etc.)
-3. Is this a FOLLOW-UP question referencing previous conversation?
+Determine THREE things:
+1. Language of the query: "bangla", "romanized_bangla", "english", or "other"
+2. Is query about AGRICULTURE? (crops, farming, pests, soil, irrigation, livestock, fertilizer, etc.)
+3. Is this a follow-up to previous conversation?
 
-Respond with ONLY valid JSON:
-{{"detected_language": "bangla|romanized_bangla|english|other", "is_agriculture": true/false, "is_followup": true/false, "reason": "brief explanation"}}"""
+CRITICAL: Respond with ONLY valid JSON, no other text. Format:
+{{"detected_language": "english", "is_agriculture": false, "is_followup": false, "reason": "explanation"}}"""
         
         try:
             messages = [
-                {"role": "system", "content": "You are a precise classifier. Always respond with valid JSON."},
+                {"role": "system", "content": "You are a precise JSON classifier. Always respond with ONLY valid JSON, nothing else."},
                 {"role": "user", "content": prompt}
             ]
             
-            response = self.llm_client.chat(messages, temperature=0.3)
+            response = self.llm_client.chat(messages, temperature=0.1)  # Lower temperature for more consistent JSON
+            
+            # Try to extract JSON if LLM added extra text
+            response = response.strip()
+            if response.startswith("```json"):
+                response = response.replace("```json", "").replace("```", "").strip()
+            elif response.startswith("```"):
+                response = response.replace("```", "").strip()
+            
             result = json.loads(response)
             
             state["detected_language"] = result.get("detected_language", "english")
@@ -167,13 +207,23 @@ Respond with ONLY valid JSON:
                        f"Agriculture: {state['is_agriculture_query']}, "
                        f"Followup: {state['is_followup']}")
             
-        except Exception as e:
-            logger.error(f"[GUARDRAIL] Classification error: {str(e)}")
-            # Safe defaults
+        except json.JSONDecodeError as e:
+            logger.error(f"[GUARDRAIL] JSON parsing error: {str(e)}")
+            logger.error(f"[GUARDRAIL] LLM Response was: {response[:200] if 'response' in locals() else 'N/A'}")
+            # SAFE DEFAULT: Reject when uncertain
             state["detected_language"] = "english"
-            state["is_agriculture_query"] = True
+            state["is_agriculture_query"] = False  # Reject by default!
             state["is_followup"] = False
             state["skip_retrieval"] = False
+            state["metadata"]["error"] = "Guardrail classification failed"
+        except Exception as e:
+            logger.error(f"[GUARDRAIL] Classification error: {str(e)}")
+            # SAFE DEFAULT: Reject when uncertain
+            state["detected_language"] = "english"
+            state["is_agriculture_query"] = False  # Reject by default!
+            state["is_followup"] = False
+            state["skip_retrieval"] = False
+            state["metadata"]["error"] = f"Guardrail error: {str(e)}"
         
         return state
     
@@ -312,8 +362,9 @@ You are an agriculture expert assistant. Your task:
 - মাটির যত্ন ও সার
 - সেচ ব্যবস্থা
 - পশুপালন
+- ছাদ কৃষি
 
-(Sorry, I can only answer agriculture-related questions. You can ask me about crops, pests, soil, irrigation, livestock, etc.)"""
+"""
         
         logger.info(f"[REJECT] Query rejected - not agriculture related")
         return state
