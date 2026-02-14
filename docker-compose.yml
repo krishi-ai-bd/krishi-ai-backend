@@ -1,13 +1,4 @@
 services:
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6380:6379"
-    volumes:
-      - redis_data:/data
-    restart: unless-stopped
-    command: redis-server --appendonly yes
-
   krishi-ai:
     build: .
     ports:
@@ -17,13 +8,14 @@ services:
       - chroma_data:/app/chroma_db
     environment:
       - PYTHONPATH=/app
-      - REDIS_URL=redis://redis:6379
+      # Connect to Redis running on host machine
+      - REDIS_URL=redis://host.docker.internal:6379
     env_file:
       - .env
-    depends_on:
-      - redis
     restart: unless-stopped
+    # Allow container to access host network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
 volumes:
-  redis_data:
   chroma_data:
