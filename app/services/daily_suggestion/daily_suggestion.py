@@ -4,6 +4,7 @@ from pydantic import ValidationError
 import json
 import openai
 from dotenv import load_dotenv
+from app.core.config import settings
 from .daily_suggestion_schema import daily_suggestion_request, daily_suggestion_response
 
 load_dotenv()
@@ -31,7 +32,19 @@ def get_bangladesh_season(today: date) -> tuple[str, str]:
 
 class DailySuggestion:
     def __init__(self):
-        self.client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        import threading
+        self.api_keys = settings.load_api_keys("openai")
+        if not self.api_keys:
+            raise ValueError("[DailySuggestion] No OpenAI API keys found. Add OPENAI_API_KEY_1 etc. to .env")
+        self._counter = 0
+        self._lock = threading.Lock()
+
+    def _get_next_client(self):
+        """Round-robin OpenAI client selection"""
+        with self._lock:
+            key = self.api_keys[self._counter % len(self.api_keys)]
+            self._counter += 1
+        return openai.OpenAI(api_key=key)
 
     def daily_suggestion(self, request: daily_suggestion_request) -> daily_suggestion_response:
         today = date.today()
@@ -88,7 +101,8 @@ class DailySuggestion:
 {{"response": "আজকের কৃষি পরামর্শ এখানে লিখুন..."}}"""
 
     def get_openai_response(self, prompt: str, data: str) -> str:
-        completion = self.client.chat.completions.create(
+        client = self._get_next_client()
+        completion = client.chat.completions.create(
             model="gpt-4-turbo",
             messages=[
                 {"role": "system", "content": prompt},
