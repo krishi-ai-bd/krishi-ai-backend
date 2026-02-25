@@ -11,9 +11,3 @@ async def daily_suggestion(
     request: daily_suggestion_request
 ):
     return daily_suggestion_agent.daily_suggestion(request)
-
-@router.post("/get_conversation", response_model=daily_suggestion_response)
-async def get_conversation(
-    request: daily_suggestion_request
-):
-    return daily_suggestion_agent.get_conversation(request)

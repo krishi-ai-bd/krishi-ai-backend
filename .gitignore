@@ -129,7 +129,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
-
+test_gemini_key.py
 # Spyder project settings
 .spyderproject
 .spyproject
