@@ -41,6 +41,13 @@ class Settings(BaseSettings):
     TOP_K_RESULTS: int = 5  # number of chunks to retrieve
     SIMILARITY_THRESHOLD: float = 0.7
     
+    # Server URL (used for building audio file URLs)
+    BASE_URL: str = os.getenv("BASE_URL")
+    
+    # Audio Configuration
+    AUDIO_DIR: str = os.getenv("AUDIO_DIR", "audio")
+    AUDIO_RETENTION_DAYS: int = int(os.getenv("AUDIO_RETENTION_DAYS", "7"))
+    
     def load_api_keys(self, provider: str) -> List[str]:
         """
         Load multiple API keys for a provider from environment variables.

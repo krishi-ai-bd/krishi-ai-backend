@@ -1,10 +1,10 @@
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 
 class daily_suggestion_request(BaseModel):
-    previous_suggestions: List[str]
+    previous_suggestions: Optional[List[str]] = None
     
 class daily_suggestion_response(BaseModel):
-    response: str
+    audio_url: str
 
 

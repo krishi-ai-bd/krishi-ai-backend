@@ -1,38 +1,63 @@
 import os
-from datetime import date
+import threading
+import uuid
+from datetime import date, datetime, timedelta
+from pathlib import Path
 from pydantic import ValidationError
 import json
 import openai
 from dotenv import load_dotenv
 from app.core.config import settings
+from app.utils.text_to_speech import tts_client
 from .daily_suggestion_schema import daily_suggestion_request, daily_suggestion_response
 
 load_dotenv()
 
-# Bangladesh agricultural seasons
+AUDIO_DIR = Path(settings.AUDIO_DIR)
+AUDIO_DIR.mkdir(exist_ok=True)
+
+
+# ─── Bangladesh Seasonal Context ─────────────────────────────────────────────
+
 def get_bangladesh_season(today: date) -> tuple[str, str]:
-    """
-    Returns (season_name_bangla, farming_context) based on the current month.
-    Bangladesh has 6 seasons (shodritu).
-    """
+    """Returns (season_name, farming_context) for the current month."""
     month = today.month
     seasons = {
-        (12, 1):  ("শীতকাল (Winter/Shit)",     "রবি ফসল মৌসুম: গম, আলু, সরিষা, ডাল, শাকসবজি চাষের উপযুক্ত সময়।"),
-        (2, 3):   ("বসন্তকাল (Spring/Basanta)", "বোরো ধানের পরিচর্যা, সবজি সংগ্রহ ও গ্রীষ্মকালীন ফসলের প্রস্তুতি।"),
-        (4, 5):   ("গ্রীষ্মকাল (Summer/Grishmo)", "আউশ ধান বপন, পাট চাষ, তরমুজ ও গ্রীষ্মকালীন সবজি চাষের উপযুক্ত সময়।"),
-        (6, 7):   ("বর্ষাকাল (Monsoon/Borsha)",  "আমন ধান রোপণ, বন্যা ব্যবস্থাপনা, জলাবদ্ধতা সহনশীল ফসলের পরিচর্যা।"),
-        (8, 9):   ("শরৎকাল (Autumn/Shorot)",    "আমন ধানের যত্ন, শাকসবজি চাষ, রবি ফসলের জমি প্রস্তুতির সময়।"),
+        (12, 1):  ("শীতকাল (Winter/Shit)",          "রবি ফসল মৌসুম: গম, আলু, সরিষা, ডাল, শাকসবজি চাষের উপযুক্ত সময়।"),
+        (2, 3):   ("বসন্তকাল (Spring/Basanta)",      "বোরো ধানের পরিচর্যা, সবজি সংগ্রহ ও গ্রীষ্মকালীন ফসলের প্রস্তুতি।"),
+        (4, 5):   ("গ্রীষ্মকাল (Summer/Grishmo)",    "আউশ ধান বপন, পাট চাষ, তরমুজ ও গ্রীষ্মকালীন সবজি চাষের উপযুক্ত সময়।"),
+        (6, 7):   ("বর্ষাকাল (Monsoon/Borsha)",       "আমন ধান রোপণ, বন্যা ব্যবস্থাপনা, জলাবদ্ধতা সহনশীল ফসলের পরিচর্যা।"),
+        (8, 9):   ("শরৎকাল (Autumn/Shorot)",          "আমন ধানের যত্ন, শাকসবজি চাষ, রবি ফসলের জমি প্রস্তুতির সময়।"),
         (10, 11): ("হেমন্তকাল (Late Autumn/Hemanto)", "আমন ধান কাটা, রবি ফসল বপন শুরু, শীতকালীন সবজি চাষ শুরু।"),
     }
     for (m1, m2), (season, context) in seasons.items():
         if month in (m1, m2):
             return season, context
-    return ("শীতকাল", "রবি ফসল মৌসুম।")  # Default fallback
+    return ("শীতকাল", "রবি ফসল মৌসুম।")
 
+
+# ─── Audio Cleanup ─────────────────────────────────────────────────────────
+
+def cleanup_old_audio_files():
+    """Delete WAV files older than AUDIO_RETENTION_DAYS (default 7 days)."""
+    cutoff = datetime.now() - timedelta(days=settings.AUDIO_RETENTION_DAYS)
+    deleted = 0
+    for audio_file in AUDIO_DIR.glob("*.wav"):
+        try:
+            file_mtime = datetime.fromtimestamp(audio_file.stat().st_mtime)
+            if file_mtime < cutoff:
+                audio_file.unlink()
+                deleted += 1
+        except Exception as e:
+            print(f"[AUDIO CLEANUP] Error deleting {audio_file.name}: {e}")
+    if deleted:
+        print(f"[AUDIO CLEANUP] Deleted {deleted} old audio file(s)")
+
+
+# ─── DailySuggestion Service ─────────────────────────────────────────────────
 
 class DailySuggestion:
     def __init__(self):
-        import threading
         self.api_keys = settings.load_api_keys("openai")
         if not self.api_keys:
             raise ValueError("[DailySuggestion] No OpenAI API keys found. Add OPENAI_API_KEY_1 etc. to .env")
@@ -40,15 +65,20 @@ class DailySuggestion:
         self._lock = threading.Lock()
 
     def _get_next_client(self):
-        """Round-robin OpenAI client selection"""
+        """Round-robin OpenAI client selection (thread-safe)"""
         with self._lock:
             key = self.api_keys[self._counter % len(self.api_keys)]
             self._counter += 1
         return openai.OpenAI(api_key=key)
 
     def daily_suggestion(self, request: daily_suggestion_request) -> daily_suggestion_response:
+        # Cleanup files older than retention period
+        cleanup_old_audio_files()
+
         today = date.today()
         season_name, season_context = get_bangladesh_season(today)
+
+        # 1. Generate text suggestion
         prompt = self.create_prompt(today, season_name, season_context)
         input_data = self.prepare_input(request)
         raw_response = self.get_openai_response(prompt, input_data)
@@ -64,22 +94,31 @@ class DailySuggestion:
                 cleaned = cleaned[:-3]
 
             parsed_json = json.loads(cleaned)
-            if "response" in parsed_json:
-                parsed_json = parsed_json["response"]
-            return daily_suggestion_response(**parsed_json)
+            suggestion_text = parsed_json.get("response", "")
 
         except json.JSONDecodeError as e:
             raise ValueError(f"Invalid JSON returned by OpenAI: {e}")
         except ValidationError as ve:
-            raise ValueError(f"Validation failed when parsing DailySuggestionResponse: {ve}")
+            raise ValueError(f"Validation failed: {ve}")
+
+        # 2. Convert text to speech via Gemini TTS
+        filename = f"suggestion_{today.strftime('%Y%m%d')}_{uuid.uuid4().hex[:8]}"
+        audio_path = tts_client.synthesize(text=suggestion_text, filename=filename)
+
+        if not audio_path:
+            raise RuntimeError("[DailySuggestion] TTS failed — no audio generated")
+
+        # 3. Build public audio URL
+        audio_filename = Path(audio_path).name
+        audio_url = f"{settings.BASE_URL.rstrip('/')}/audio/{audio_filename}"
+
+        return daily_suggestion_response(audio_url=audio_url)
 
     def prepare_input(self, request: daily_suggestion_request) -> str:
         """Format previous suggestions as input context"""
         if not request.previous_suggestions:
             return "কোনো পূর্ববর্তী পরামর্শ নেই।"
-        suggestions_text = "\n".join(
-            f"- {s}" for s in request.previous_suggestions
-        )
+        suggestions_text = "\n".join(f"- {s}" for s in request.previous_suggestions)
         return f"পূর্ববর্তী পরামর্শসমূহ:\n{suggestions_text}"
 
     def create_prompt(self, today: date, season_name: str, season_context: str) -> str:

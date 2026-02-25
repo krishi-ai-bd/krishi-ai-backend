@@ -1,6 +1,5 @@
 import os
 import wave
-import struct
 import logging
 import threading
 from pathlib import Path
@@ -12,23 +11,22 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 # Audio output directory
-AUDIO_DIR = Path("audio")
+AUDIO_DIR = Path(os.getenv("AUDIO_DIR", "audio"))
 AUDIO_DIR.mkdir(exist_ok=True)
 
 
 class GeminiTTSClient:
     """
-    Text-to-Speech using Gemini 2.0 Flash.
+    Text-to-Speech using Google Gemini (google-genai SDK).
     - Loads all GEMINI_API_KEY_N keys from environment
     - Round-robin rotation with automatic failover if a key fails
     - Saves audio as WAV files to the audio/ folder
     """
 
-    GEMINI_TTS_MODEL = "gemini-2.0-flash-preview-tts"  # TTS-capable model
-    VOICE_NAME = "Aoede"  # Supports Bangla naturally
+    GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts"
+    VOICE_NAME = "Aoede"  # Natural-sounding voice with Bangla support
 
     def __init__(self):
-        import threading
         self.api_keys = self._load_api_keys()
 
         if not self.api_keys:
@@ -37,7 +35,6 @@ class GeminiTTSClient:
             logger.info(f"[TTS] Loaded {len(self.api_keys)} Gemini API key(s)")
             logger.info(f"[TTS] Round-robin with failover enabled")
 
-        # Thread-safe round-robin counter
         self._counter = 0
         self._lock = threading.Lock()
 
@@ -56,7 +53,7 @@ class GeminiTTSClient:
         # Fallback to single GEMINI_API_KEY
         if not keys:
             single = os.getenv("GEMINI_API_KEY", "")
-            if single:
+            if single and single.lower() != "none":
                 keys.append(single)
 
         return keys
@@ -74,8 +71,8 @@ class GeminiTTSClient:
         """Save raw PCM audio bytes as a proper WAV file"""
         with wave.open(str(output_path), "wb") as wf:
             wf.setnchannels(1)       # Mono
-            wf.setsampwidth(2)       # 16-bit
-            wf.setframerate(24000)   # Gemini outputs 24kHz
+            wf.setsampwidth(2)       # 16-bit PCM
+            wf.setframerate(24000)   # Gemini TTS outputs at 24kHz
             wf.writeframes(audio_data)
 
     def synthesize(self, text: str, filename: str) -> Optional[str]:
@@ -93,12 +90,13 @@ class GeminiTTSClient:
             logger.error("[TTS] No API keys available")
             return None
 
-        import google.generativeai as genai
-        
+        # Use the new google-genai SDK
+        from google import genai
+        from google.genai import types
+
         output_path = AUDIO_DIR / f"{filename}.wav"
         attempted_keys = set()
 
-        # Try each key with failover
         for attempt in range(len(self.api_keys)):
             api_key = self._get_next_key()
             key_index = (self._counter - 1) % len(self.api_keys) + 1
@@ -115,11 +113,11 @@ class GeminiTTSClient:
                 response = client.models.generate_content(
                     model=self.GEMINI_TTS_MODEL,
                     contents=text,
-                    config=genai.types.GenerateContentConfig(
+                    config=types.GenerateContentConfig(
                         response_modalities=["AUDIO"],
-                        speech_config=genai.types.SpeechConfig(
-                            voice_config=genai.types.VoiceConfig(
-                                prebuilt_voice_config=genai.types.PrebuiltVoiceConfig(
+                        speech_config=types.SpeechConfig(
+                            voice_config=types.VoiceConfig(
+                                prebuilt_voice_config=types.PrebuiltVoiceConfig(
                                     voice_name=self.VOICE_NAME
                                 )
                             )
@@ -127,13 +125,13 @@ class GeminiTTSClient:
                     ),
                 )
 
-                # Extract audio bytes from response
+                # Extract raw PCM audio bytes from response
                 audio_data = response.candidates[0].content.parts[0].inline_data.data
 
-                # Save as WAV
+                # Save as WAV with proper headers
                 self._save_as_wav(audio_data, output_path)
 
-                logger.info(f"[TTS] Audio saved to: {output_path}")
+                logger.info(f"[TTS] Audio saved: {output_path}")
                 return str(output_path)
 
             except Exception as e:
