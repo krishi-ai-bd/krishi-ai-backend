@@ -82,20 +82,13 @@ class DailySuggestion:
 
     def get_today_suggestion(self) -> daily_suggestion_response:
         """
-        GET handler - returns today's audio URL.
-        If audio already generated today, returns cached URL immediately.
-        If not yet generated, generates it on-demand.
+        GET handler - returns today's audio URL only if already generated.
+        Returns None if not yet generated today (frontend should try again later).
         """
         today_path = self._get_today_audio_path()
-
         if today_path.exists():
-            # Already generated today — return cached URL
-            print(f"[DailySuggestion] Returning cached audio for today: {today_path.name}")
             return daily_suggestion_response(audio_url=self._get_today_audio_url())
-
-        # Not generated yet — generate now
-        print(f"[DailySuggestion] No audio for today yet, generating...")
-        return self._generate_and_save(previous_suggestions=[])
+        return None
 
     def daily_suggestion(self, request: daily_suggestion_request) -> daily_suggestion_response:
         """
@@ -108,6 +101,7 @@ class DailySuggestion:
     def generate_scheduled(self):
         """
         Called by the APScheduler daily job.
+        Uses the same logic as the POST endpoint.
         Skips if today's audio was already generated.
         """
         today_path = self._get_today_audio_path()
