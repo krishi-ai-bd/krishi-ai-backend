@@ -1,17 +1,41 @@
 from pathlib import Path
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from apscheduler.schedulers.background import BackgroundScheduler
 from app.services.chat.chat_route import router as chat_router
 from app.utils.knowledge.knowledge_route import router as knowledge_router
-from app.services.daily_suggestion.daily_suggestion_route import router as daily_suggestion_router
+from app.services.daily_suggestion.daily_suggestion_route import router as daily_suggestion_router, daily_suggestion_agent
 from app.core.config import settings
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Start/stop APScheduler for daily suggestion generation."""
+    scheduler = BackgroundScheduler(timezone="UTC")
+    scheduler.add_job(
+        func=daily_suggestion_agent.generate_scheduled,
+        trigger="cron",
+        hour=settings.DAILY_SUGGESTION_HOUR,
+        minute=0,
+        id="daily_suggestion",
+        replace_existing=True,
+    )
+    scheduler.start()
+    print(f"[SCHEDULER] Daily suggestion scheduled at {settings.DAILY_SUGGESTION_HOUR:02d}:00 UTC "
+          f"(≈ {(settings.DAILY_SUGGESTION_HOUR + 6) % 24:02d}:00 Bangladesh time)")
+    yield  # App runs here
+    scheduler.shutdown()
+    print("[SCHEDULER] Scheduler stopped.")
+
 
 # Initialize FastAPI app
 app = FastAPI(
     title="Krishi AI Backend",
     description="Agricultural AI Assistant with RAG and Conversation Management",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan,
 )
 
 # CORS middleware
@@ -49,19 +73,19 @@ async def health_check():
     """Detailed health check"""
     from app.vectordb.manager import vector_db
     from app.utils.cache_manager import cache_manager
-    
+
     health_status = {
         "api": "healthy",
         "redis": "healthy" if cache_manager.redis_client else "unavailable",
         "vector_db": "healthy"
     }
-    
+
     try:
         stats = vector_db.get_collection_stats()
         health_status["vector_db_chunks"] = stats.get("total_chunks", 0)
     except:
         health_status["vector_db"] = "error"
-    
+
     return health_status
 
 

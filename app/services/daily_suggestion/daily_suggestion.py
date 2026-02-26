@@ -1,6 +1,5 @@
 import os
 import threading
-import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from pydantic import ValidationError
@@ -23,12 +22,12 @@ def get_bangladesh_season(today: date) -> tuple[str, str]:
     """Returns (season_name, farming_context) for the current month."""
     month = today.month
     seasons = {
-        (12, 1):  ("শীতকাল (Winter/Shit)",          "রবি ফসল মৌসুম: গম, আলু, সরিষা, ডাল, শাকসবজি চাষের উপযুক্ত সময়।"),
-        (2, 3):   ("বসন্তকাল (Spring/Basanta)",      "বোরো ধানের পরিচর্যা, সবজি সংগ্রহ ও গ্রীষ্মকালীন ফসলের প্রস্তুতি।"),
-        (4, 5):   ("গ্রীষ্মকাল (Summer/Grishmo)",    "আউশ ধান বপন, পাট চাষ, তরমুজ ও গ্রীষ্মকালীন সবজি চাষের উপযুক্ত সময়।"),
-        (6, 7):   ("বর্ষাকাল (Monsoon/Borsha)",       "আমন ধান রোপণ, বন্যা ব্যবস্থাপনা, জলাবদ্ধতা সহনশীল ফসলের পরিচর্যা।"),
-        (8, 9):   ("শরৎকাল (Autumn/Shorot)",          "আমন ধানের যত্ন, শাকসবজি চাষ, রবি ফসলের জমি প্রস্তুতির সময়।"),
-        (10, 11): ("হেমন্তকাল (Late Autumn/Hemanto)", "আমন ধান কাটা, রবি ফসল বপন শুরু, শীতকালীন সবজি চাষ শুরু।"),
+        (12, 1):  ("শীতকাল (Winter)",          "রবি ফসল মৌসুম: গম, আলু, সরিষা, ডাল, শাকসবজি চাষের উপযুক্ত সময়।"),
+        (2, 3):   ("বসন্তকাল (Spring)",          "বোরো ধানের পরিচর্যা, সবজি সংগ্রহ ও গ্রীষ্মকালীন ফসলের প্রস্তুতি।"),
+        (4, 5):   ("গ্রীষ্মকাল (Summer)",        "আউশ ধান বপন, পাট চাষ, তরমুজ ও গ্রীষ্মকালীন সবজি চাষের উপযুক্ত সময়।"),
+        (6, 7):   ("বর্ষাকাল (Monsoon)",          "আমন ধান রোপণ, বন্যা ব্যবস্থাপনা, জলাবদ্ধতা সহনশীল ফসলের পরিচর্যা।"),
+        (8, 9):   ("শরৎকাল (Autumn)",             "আমন ধানের যত্ন, শাকসবজি চাষ, রবি ফসলের জমি প্রস্তুতির সময়।"),
+        (10, 11): ("হেমন্তকাল (Late Autumn)",     "আমন ধান কাটা, রবি ফসল বপন শুরু, শীতকালীন সবজি চাষ শুরু।"),
     }
     for (m1, m2), (season, context) in seasons.items():
         if month in (m1, m2):
@@ -71,16 +70,67 @@ class DailySuggestion:
             self._counter += 1
         return openai.OpenAI(api_key=key)
 
-    def daily_suggestion(self, request: daily_suggestion_request) -> daily_suggestion_response:
-        # Cleanup files older than retention period
-        cleanup_old_audio_files()
+    def _get_today_audio_path(self) -> Path:
+        """Returns the expected file path for today's audio."""
+        today_str = date.today().strftime("%Y%m%d")
+        return AUDIO_DIR / f"suggestion_{today_str}.wav"
 
+    def _get_today_audio_url(self) -> str:
+        """Builds the public URL for today's audio file."""
+        filename = self._get_today_audio_path().name
+        return f"{settings.BASE_URL.rstrip('/')}/audio/{filename}"
+
+    def get_today_suggestion(self) -> daily_suggestion_response:
+        """
+        GET handler - returns today's audio URL.
+        If audio already generated today, returns cached URL immediately.
+        If not yet generated, generates it on-demand.
+        """
+        today_path = self._get_today_audio_path()
+
+        if today_path.exists():
+            # Already generated today — return cached URL
+            print(f"[DailySuggestion] Returning cached audio for today: {today_path.name}")
+            return daily_suggestion_response(audio_url=self._get_today_audio_url())
+
+        # Not generated yet — generate now
+        print(f"[DailySuggestion] No audio for today yet, generating...")
+        return self._generate_and_save(previous_suggestions=[])
+
+    def daily_suggestion(self, request: daily_suggestion_request) -> daily_suggestion_response:
+        """
+        POST handler - force regenerate today's audio (manual trigger/override).
+        Always regenerates even if today's file already exists.
+        """
+        cleanup_old_audio_files()
+        return self._generate_and_save(previous_suggestions=request.previous_suggestions)
+
+    def generate_scheduled(self):
+        """
+        Called by the APScheduler daily job.
+        Skips if today's audio was already generated.
+        """
+        today_path = self._get_today_audio_path()
+        if today_path.exists():
+            print(f"[SCHEDULER] Audio for today already exists, skipping.")
+            return
+
+        print(f"[SCHEDULER] Generating daily suggestion audio...")
+        cleanup_old_audio_files()
+        try:
+            self._generate_and_save(previous_suggestions=[])
+            print(f"[SCHEDULER] Daily suggestion generated successfully.")
+        except Exception as e:
+            print(f"[SCHEDULER] Error generating daily suggestion: {e}")
+
+    def _generate_and_save(self, previous_suggestions: list) -> daily_suggestion_response:
+        """Core logic: generate text suggestion → convert to audio → return URL."""
         today = date.today()
         season_name, season_context = get_bangladesh_season(today)
 
         # 1. Generate text suggestion
         prompt = self.create_prompt(today, season_name, season_context)
-        input_data = self.prepare_input(request)
+        input_data = self.prepare_input(previous_suggestions)
         raw_response = self.get_openai_response(prompt, input_data)
         print("RAW OPENAI RESPONSE:\n", raw_response)
 
@@ -92,33 +142,24 @@ class DailySuggestion:
                 cleaned = cleaned[3:]
             if cleaned.endswith("```"):
                 cleaned = cleaned[:-3]
-
             parsed_json = json.loads(cleaned)
             suggestion_text = parsed_json.get("response", "")
-
         except json.JSONDecodeError as e:
-            raise ValueError(f"Invalid JSON returned by OpenAI: {e}")
-        except ValidationError as ve:
-            raise ValueError(f"Validation failed: {ve}")
+            raise ValueError(f"Invalid JSON from OpenAI: {e}")
 
-        # 2. Convert text to speech via Gemini TTS
-        filename = f"suggestion_{today.strftime('%Y%m%d')}_{uuid.uuid4().hex[:8]}"
+        # 2. Convert to speech — use date-based filename (idempotent)
+        filename = f"suggestion_{today.strftime('%Y%m%d')}"
         audio_path = tts_client.synthesize(text=suggestion_text, filename=filename)
 
         if not audio_path:
             raise RuntimeError("[DailySuggestion] TTS failed — no audio generated")
 
-        # 3. Build public audio URL
-        audio_filename = Path(audio_path).name
-        audio_url = f"{settings.BASE_URL.rstrip('/')}/audio/{audio_filename}"
+        return daily_suggestion_response(audio_url=self._get_today_audio_url())
 
-        return daily_suggestion_response(audio_url=audio_url)
-
-    def prepare_input(self, request: daily_suggestion_request) -> str:
-        """Format previous suggestions as input context"""
-        if not request.previous_suggestions:
+    def prepare_input(self, previous_suggestions: list) -> str:
+        if not previous_suggestions:
             return "কোনো পূর্ববর্তী পরামর্শ নেই।"
-        suggestions_text = "\n".join(f"- {s}" for s in request.previous_suggestions)
+        suggestions_text = "\n".join(f"- {s}" for s in previous_suggestions)
         return f"পূর্ববর্তী পরামর্শসমূহ:\n{suggestions_text}"
 
     def create_prompt(self, today: date, season_name: str, season_context: str) -> str:

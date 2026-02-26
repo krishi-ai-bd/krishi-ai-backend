@@ -47,6 +47,8 @@ class Settings(BaseSettings):
     # Audio Configuration
     AUDIO_DIR: str = os.getenv("AUDIO_DIR", "audio")
     AUDIO_RETENTION_DAYS: int = int(os.getenv("AUDIO_RETENTION_DAYS", "7"))
+    # Hour (UTC) to auto-generate daily suggestion. Default 0 UTC = 6 AM Bangladesh (UTC+6)
+    DAILY_SUGGESTION_HOUR: int = int(os.getenv("DAILY_SUGGESTION_HOUR", "0"))
     
     def load_api_keys(self, provider: str) -> List[str]:
         """
