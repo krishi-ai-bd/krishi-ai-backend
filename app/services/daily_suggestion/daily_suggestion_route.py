@@ -10,15 +10,19 @@ daily_suggestion_agent = DailySuggestion()
 async def get_daily_suggestion():
     """
     Returns today's daily agricultural suggestion audio URL.
-    Returns 404 if today's audio hasn't been generated yet (wait for scheduler or call POST).
+    - If already generated today: returns cached URL instantly (no cost)
+    - If not yet generated (e.g. scheduler missed): auto-generates and returns URL
     """
-    result = daily_suggestion_agent.get_today_suggestion()
-    if result is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Today's suggestion audio not yet generated. It will be ready at the scheduled time."
-        )
-    return result
+    try:
+        result = daily_suggestion_agent.get_today_suggestion()
+        if result is None:
+            # Scheduler missed — generate now as fallback
+            result = daily_suggestion_agent.daily_suggestion(
+                daily_suggestion_request(previous_suggestions=[])
+            )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/daily_suggestion", response_model=daily_suggestion_response)
