@@ -38,7 +38,7 @@ def get_bangladesh_season(today: date) -> tuple[str, str]:
 # ─── Audio Cleanup ─────────────────────────────────────────────────────────
 
 def cleanup_old_audio_files():
-    """Delete WAV files older than AUDIO_RETENTION_DAYS (default 7 days)."""
+    """Delete WAV + companion TXT files older than AUDIO_RETENTION_DAYS (default 7 days)."""
     cutoff = datetime.now() - timedelta(days=settings.AUDIO_RETENTION_DAYS)
     deleted = 0
     for audio_file in AUDIO_DIR.glob("*.wav"):
@@ -46,6 +46,10 @@ def cleanup_old_audio_files():
             file_mtime = datetime.fromtimestamp(audio_file.stat().st_mtime)
             if file_mtime < cutoff:
                 audio_file.unlink()
+                # Also delete companion title file
+                title_file = audio_file.with_suffix(".txt")
+                if title_file.exists():
+                    title_file.unlink()
                 deleted += 1
         except Exception as e:
             print(f"[AUDIO CLEANUP] Error deleting {audio_file.name}: {e}")
@@ -83,11 +87,14 @@ class DailySuggestion:
     def get_today_suggestion(self) -> daily_suggestion_response:
         """
         GET handler - returns today's audio URL only if already generated.
-        Returns None if not yet generated today (frontend should try again later).
+        Returns None if not yet generated today.
         """
         today_path = self._get_today_audio_path()
         if today_path.exists():
-            return daily_suggestion_response(audio_url=self._get_today_audio_url())
+            # Load title from companion file
+            title_path = today_path.with_suffix(".txt")
+            title = title_path.read_text(encoding="utf-8").strip() if title_path.exists() else "দৈনিক পরামর্শ"
+            return daily_suggestion_response(audio_url=self._get_today_audio_url(), title=title)
         return None
 
     def daily_suggestion(self, request: daily_suggestion_request) -> daily_suggestion_response:
@@ -138,6 +145,7 @@ class DailySuggestion:
                 cleaned = cleaned[:-3]
             parsed_json = json.loads(cleaned)
             suggestion_text = parsed_json.get("response", "")
+            suggestion_title = parsed_json.get("title", "দৈনিক পরামর্শ")
         except json.JSONDecodeError as e:
             raise ValueError(f"Invalid JSON from OpenAI: {e}")
 
@@ -148,7 +156,14 @@ class DailySuggestion:
         if not audio_path:
             raise RuntimeError("[DailySuggestion] TTS failed — no audio generated")
 
-        return daily_suggestion_response(audio_url=self._get_today_audio_url())
+        # Save title to companion file for future GET requests
+        title_path = Path(audio_path).with_suffix(".txt")
+        title_path.write_text(suggestion_title, encoding="utf-8")
+
+        return daily_suggestion_response(
+            audio_url=self._get_today_audio_url(),
+            title=suggestion_title
+        )
 
     def prepare_input(self, previous_suggestions: list) -> str:
         if not previous_suggestions:
@@ -172,7 +187,7 @@ class DailySuggestion:
 ৬. প্রতিটি পরামর্শ সংক্ষিপ্ত কিন্তু তথ্যবহুল হতে হবে।
 
 আউটপুট ফরম্যাট (শুধুমাত্র JSON):
-{{"response": "আজকের কৃষি পরামর্শ এখানে লিখুন..."}}"""
+{{"title": "২-৩ শব্দের শিরোনাম", "response": "আজকের কৃষি পরামর্শ এখানে লিখুন..."}}"""
 
     def get_openai_response(self, prompt: str, data: str) -> str:
         client = self._get_next_client()
