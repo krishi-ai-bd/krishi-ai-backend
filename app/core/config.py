@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     SIMILARITY_THRESHOLD: float = 0.7
     
     # Server URL (used for building audio file URLs)
-    BASE_URL: str = os.getenv("BASE_URL")
+    BASE_URL: str
     
     # Audio Configuration
     AUDIO_DIR: str = os.getenv("AUDIO_DIR", "audio")
